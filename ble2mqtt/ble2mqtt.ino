@@ -1,20 +1,25 @@
+#define _GLIBCXX_HAVE_BROKEN_VSWPRINTF 1
+#undef min
+#undef max
+
+#include <queue>
 #include <WiFi.h>
-#include <PubSubClient.h>
+#include <AsyncMqttClient.h>
 #include "BLEDevice.h"
 #include <M5StickCPlus.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+
 // Wi-Fi/MQTT Config
 const char* ssid = "AndroidAP284C";
 const char* password = "cufj4615";
-const char* mqttBroker = "192.168.59.37";
+const char* mqttBroker = "test.mosquitto.org";
 const int mqttPort = 1883;
 
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+AsyncMqttClient mqttClient;
 
-// BLE Config
+// BLE Config (unchanged from your original code)
 #define bleServerName "ParcelG22"
 BLEScan* pBLEScan;
 BLEAdvertisedDevice* targetDevice;
@@ -36,32 +41,8 @@ const int MAX_SCREEN_LINES = 7;
 String screenBuffer[MAX_SCREEN_LINES];
 int currentScreenLine = 0;
 
-// BLE Notification Callback
-static void gyroNotifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
-                               uint8_t* pData, size_t length, bool isNotify) {
-  if (length < sizeof(gyroBuffer)) {
-    memset(gyroBuffer, 0, sizeof(gyroBuffer));
-    strncpy(gyroBuffer, (char*)pData, length);
-    newGyro = true;
-    debugPrintln("BLE Received: " + String(gyroBuffer));
-  }
-}
-
-class MyClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* pclient) {}
-  
-  void onDisconnect(BLEClient* pclient) {
-    Connected = false;
-    debugPrintln("BLE Disconnected");
-    BLEDevice::deinit(true);
-    delay(500);
-    BLEDevice::init("");
-    pBLEScan = BLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-    pBLEScan->setActiveScan(true);
-    pBLEScan->start(5);
-  }
-};
+// Message queue for QoS 1
+std::queue<String> messageQueue;
 
 // Custom debug output
 void debugPrintln(String message) {
@@ -80,9 +61,20 @@ void debugPrintln(String message) {
   }
 }
 
+// BLE Notification Callback (unchanged)
+static void gyroNotifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
+                               uint8_t* pData, size_t length, bool isNotify) {
+  if (length < sizeof(gyroBuffer)) {
+    memset(gyroBuffer, 0, sizeof(gyroBuffer));
+    strncpy(gyroBuffer, (char*)pData, length);
+    newGyro = true;
+    debugPrintln("BLE Received: " + String(gyroBuffer));
+  }
+}
+
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) {
-    if (advertisedDevice.getName() == bleServerName)) {
+    if (advertisedDevice.getName() == bleServerName) {
       advertisedDevice.getScan()->stop();
       pServerAddress = new BLEAddress(advertisedDevice.getAddress());
       doConnect = true;
@@ -90,6 +82,66 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     }
   }
 };
+
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {}
+  
+  void onDisconnect(BLEClient* pclient) {
+    Connected = false;
+    debugPrintln("BLE Disconnected");
+    BLEDevice::deinit(true);
+    delay(500);
+    BLEDevice::init("");
+    pBLEScan = BLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setActiveScan(true);
+    pBLEScan->start(5);
+  }
+};
+
+// MQTT Event Handlers
+void onMqttConnect(bool sessionPresent) {
+  debugPrintln("MQTT Connected");
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  debugPrintln("MQTT Disconnected");
+}
+
+void onMqttPublish(uint16_t packetId) {
+  debugPrintln("Publish acknowledged (QoS 1)");
+}
+
+void connectToMqtt() {
+  debugPrintln("Connecting to MQTT...");
+  mqttClient.connect();
+}
+
+void WiFiEvent(WiFiEvent_t event) {
+  switch(event) {
+    case SYSTEM_EVENT_STA_GOT_IP:
+      connectToMqtt();
+      break;
+    case SYSTEM_EVENT_STA_DISCONNECTED:
+      debugPrintln("WiFi lost connection");
+      break;
+    default:
+      break;
+  }
+}
+
+void mqttTask(void *pv) {
+  while(1) {
+    // Process message queue
+    if (mqttClient.connected() && !messageQueue.empty()) {
+      String message = messageQueue.front();
+      uint16_t packetId = mqttClient.publish("lock/mqtt", 1, true, message.c_str());
+      debugPrintln("Publishing (QoS 1): " + message + " PID: " + String(packetId));
+      messageQueue.pop();
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
 
 bool connectToServer(BLEAddress pAddress) {
   BLEClient* pClient = BLEDevice::createClient();
@@ -119,21 +171,6 @@ bool connectToServer(BLEAddress pAddress) {
   return true;
 }
 
-void mqttTask(void *pv) {
-  while(1) {
-    if (!mqttClient.connected()) {
-      debugPrintln("MQTT Disconnected");
-      while (!mqttClient.connect("M5StickCPlus", "jiamin", "jiamin")) {
-        debugPrintln("MQTT Retrying...");
-        delay(5000);
-      }
-      debugPrintln("MQTT Connected");
-    }
-    mqttClient.loop();
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-  }
-}
-
 void bleTask(void *pv) {
   while(1) {
     if (doConnect) {
@@ -146,8 +183,8 @@ void bleTask(void *pv) {
     }
     
     if (newGyro) {
-      mqttClient.publish("lock/mqtt", gyroBuffer);
-      debugPrintln("Published: " + String(gyroBuffer));
+      messageQueue.push(String(gyroBuffer));
+      debugPrintln("Queued: " + String(gyroBuffer));
       newGyro = false;
     }
     
@@ -159,33 +196,36 @@ void setup() {
   M5.begin();
   Serial.begin(115200);
   
-  // Initialize display
   M5.Lcd.setRotation(3);
   M5.Lcd.setTextSize(1);
   M5.Lcd.setTextColor(WHITE);
   M5.Lcd.fillScreen(BLACK);
   debugPrintln("Initializing...");
 
-  // Memory optimization for BLE
+  // Memory optimization
   esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
   WiFi.mode(WIFI_MODE_STA);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
+  // Setup WiFi events
+  WiFi.onEvent(WiFiEvent);
+
   // Connect to WiFi
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    debugPrintln("Connecting WiFi...");
-  }
-  debugPrintln("WiFi connected");
-  
-  // Setup MQTT
-  mqttClient.setServer(mqttBroker, mqttPort);
-  mqttClient.setBufferSize(512);
 
-  // Setup BLE
+  // Configure MQTT client
+  mqttClient.setServer(mqttBroker, mqttPort);
+  mqttClient.setClientId("M5StickCPlus");
+  mqttClient.setKeepAlive(10);
+  mqttClient.setCleanSession(false); // For QoS 1 persistent sessions
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onDisconnect(onMqttDisconnect);
+  mqttClient.onPublish(onMqttPublish);
+
+  // Setup BLE (unchanged)
   BLEDevice::init("");
   pBLEScan = BLEDevice::getScan();
+
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setActiveScan(true);
   pBLEScan->start(5);
@@ -213,6 +253,5 @@ void setup() {
 }
 
 void loop() {
-  // FreeRTOS tasks handle everything
   delay(1000);
 }
